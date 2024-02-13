@@ -34,10 +34,13 @@ import makeWASocket, {
   WAMessageUpdate,
   WASocket,
 } from '@whiskeysockets/baileys';
+import { Label } from '@whiskeysockets/baileys/lib/Types/Label';
+import { LabelAssociation } from '@whiskeysockets/baileys/lib/Types/LabelAssociation';
 import axios from 'axios';
 import { exec, execSync } from 'child_process';
 import { arrayUnique, isBase64, isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
+import levenshtein from 'fast-levenshtein';
 import fs, { existsSync, readFileSync } from 'fs';
 import Long from 'long';
 import NodeCache from 'node-cache';
@@ -45,7 +48,6 @@ import { getMIMEType } from 'node-mime-types';
 import { release } from 'os';
 import { join } from 'path';
 import P from 'pino';
-import { ProxyAgent } from 'proxy-agent';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
@@ -73,6 +75,8 @@ import { dbserver } from '../../libs/db.connect';
 import { RedisCache } from '../../libs/redis.client';
 import { getIO } from '../../libs/socket.server';
 import { getSQS, removeQueues as removeQueuesSQS } from '../../libs/sqs.server';
+import { chatwootImport } from '../../utils/chatwoot-import-helper';
+import { makeProxyAgent } from '../../utils/makeProxyAgent';
 import { useMultiFileAuthStateDb } from '../../utils/use-multi-file-auth-state-db';
 import { useMultiFileAuthStateRedisDb } from '../../utils/use-multi-file-auth-state-redis-db';
 import {
@@ -85,9 +89,11 @@ import {
   PrivacySettingDto,
   ReadMessageDto,
   SendPresenceDto,
+  UpdateMessageDto,
   WhatsAppNumberDto,
 } from '../dto/chat.dto';
 import {
+  AcceptGroupInvite,
   CreateGroupDto,
   GetParticipant,
   GroupDescriptionDto,
@@ -100,6 +106,8 @@ import {
   GroupUpdateParticipantDto,
   GroupUpdateSettingDto,
 } from '../dto/group.dto';
+import { InstanceDto } from '../dto/instance.dto';
+import { HandleLabelDto, LabelDto } from '../dto/label.dto';
 import {
   ContactMessage,
   MediaMessage,
@@ -130,6 +138,7 @@ import { MessageUpQuery } from '../repository/messageUp.repository';
 import { RepositoryBroker } from '../repository/repository.manager';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '../types/wa.types';
 import { waMonitor } from '../whatsapp.module';
+import { CacheService } from './cache.service';
 import { ChamaaiService } from './chamaai.service';
 import { ChatwootService } from './chatwoot.service';
 import { TypebotService } from './typebot.service';
@@ -142,6 +151,7 @@ export class WAStartupService {
     private readonly eventEmitter: EventEmitter2,
     private readonly repository: RepositoryBroker,
     private readonly cache: RedisCache,
+    private readonly chatwootCache: CacheService,
   ) {
     this.logger.verbose('WAStartupService initialized');
     this.cleanStore();
@@ -169,7 +179,7 @@ export class WAStartupService {
 
   private phoneNumber: string;
 
-  private chatwootService = new ChatwootService(waMonitor, this.configService, this.repository);
+  private chatwootService = new ChatwootService(waMonitor, this.configService, this.repository, this.chatwootCache);
 
   private typebotService = new TypebotService(waMonitor, this.configService, this.eventEmitter);
 
@@ -350,6 +360,15 @@ export class WAStartupService {
     this.localChatwoot.conversation_pending = data?.conversation_pending;
     this.logger.verbose(`Chatwoot conversation pending: ${this.localChatwoot.conversation_pending}`);
 
+    this.localChatwoot.import_contacts = data?.import_contacts;
+    this.logger.verbose(`Chatwoot import contacts: ${this.localChatwoot.import_contacts}`);
+
+    this.localChatwoot.import_messages = data?.import_messages;
+    this.logger.verbose(`Chatwoot import messages: ${this.localChatwoot.import_messages}`);
+
+    this.localChatwoot.days_limit_import_messages = data?.days_limit_import_messages;
+    this.logger.verbose(`Chatwoot days limit import messages: ${this.localChatwoot.days_limit_import_messages}`);
+
     this.logger.verbose('Chatwoot loaded');
   }
 
@@ -364,8 +383,13 @@ export class WAStartupService {
     this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
     this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
     this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
+    this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
+    this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
+    this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
 
     Object.assign(this.localChatwoot, { ...data, sign_delimiter: data.sign_msg ? data.sign_delimiter : null });
+
+    this.clearCacheChatwoot();
 
     this.logger.verbose('Chatwoot set');
   }
@@ -387,6 +411,9 @@ export class WAStartupService {
     this.logger.verbose(`Chatwoot sign delimiter: ${data.sign_delimiter}`);
     this.logger.verbose(`Chatwoot reopen conversation: ${data.reopen_conversation}`);
     this.logger.verbose(`Chatwoot conversation pending: ${data.conversation_pending}`);
+    this.logger.verbose(`Chatwoot import contacts: ${data.import_contacts}`);
+    this.logger.verbose(`Chatwoot import messages: ${data.import_messages}`);
+    this.logger.verbose(`Chatwoot days limit import messages: ${data.days_limit_import_messages}`);
 
     return {
       enabled: data.enabled,
@@ -398,7 +425,18 @@ export class WAStartupService {
       sign_delimiter: data.sign_delimiter || null,
       reopen_conversation: data.reopen_conversation,
       conversation_pending: data.conversation_pending,
+      import_contacts: data.import_contacts,
+      import_messages: data.import_messages,
+      days_limit_import_messages: data.days_limit_import_messages,
     };
+  }
+
+  public clearCacheChatwoot() {
+    this.logger.verbose('Removing cache from chatwoot');
+
+    if (this.localChatwoot.enabled) {
+      this.chatwootService.getCache()?.deleteAll(this.instanceName);
+    }
   }
 
   private async loadSettings() {
@@ -422,6 +460,9 @@ export class WAStartupService {
     this.localSettings.read_status = data?.read_status;
     this.logger.verbose(`Settings read_status: ${this.localSettings.read_status}`);
 
+    this.localSettings.sync_full_history = data?.sync_full_history;
+    this.logger.verbose(`Settings sync_full_history: ${this.localSettings.sync_full_history}`);
+
     this.logger.verbose('Settings loaded');
   }
 
@@ -434,6 +475,7 @@ export class WAStartupService {
     this.logger.verbose(`Settings always_online: ${data.always_online}`);
     this.logger.verbose(`Settings read_messages: ${data.read_messages}`);
     this.logger.verbose(`Settings read_status: ${data.read_status}`);
+    this.logger.verbose(`Settings sync_full_history: ${data.sync_full_history}`);
     Object.assign(this.localSettings, data);
     this.logger.verbose('Settings set');
 
@@ -455,6 +497,7 @@ export class WAStartupService {
     this.logger.verbose(`Settings always_online: ${data.always_online}`);
     this.logger.verbose(`Settings read_messages: ${data.read_messages}`);
     this.logger.verbose(`Settings read_status: ${data.read_status}`);
+    this.logger.verbose(`Settings sync_full_history: ${data.sync_full_history}`);
     return {
       reject_call: data.reject_call,
       msg_call: data.msg_call,
@@ -462,6 +505,7 @@ export class WAStartupService {
       always_online: data.always_online,
       read_messages: data.read_messages,
       read_status: data.read_status,
+      sync_full_history: data.sync_full_history,
     };
   }
 
@@ -779,6 +823,7 @@ export class WAStartupService {
           amqp.assertExchange(exchangeName, 'topic', {
             durable: true,
             autoDelete: false,
+            assert: true,
           });
 
           const queueName = `${this.instanceName}.${event}`;
@@ -1369,18 +1414,22 @@ export class WAStartupService {
       if (this.localProxy.enabled) {
         this.logger.info('Proxy enabled: ' + this.localProxy.proxy);
 
-        if (this.localProxy.proxy.includes('proxyscrape')) {
-          const response = await axios.get(this.localProxy.proxy);
-          const text = response.data;
-          const proxyUrls = text.split('\r\n');
-          const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          const proxyUrl = 'http://' + proxyUrls[rand];
-          options = {
-            agent: new ProxyAgent(proxyUrl as any),
-          };
+        if (this.localProxy.proxy.host.includes('proxyscrape')) {
+          try {
+            const response = await axios.get(this.localProxy.proxy.host);
+            const text = response.data;
+            const proxyUrls = text.split('\r\n');
+            const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
+            const proxyUrl = 'http://' + proxyUrls[rand];
+            options = {
+              agent: makeProxyAgent(proxyUrl),
+            };
+          } catch (error) {
+            this.localProxy.enabled = false;
+          }
         } else {
           options = {
-            agent: new ProxyAgent(this.localProxy.proxy as any),
+            agent: makeProxyAgent(this.localProxy.proxy),
           };
         }
       }
@@ -1410,23 +1459,26 @@ export class WAStartupService {
         msgRetryCounterCache: this.msgRetryCounterCache,
         getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
         generateHighQualityLinkPreview: true,
-        syncFullHistory: false,
+        syncFullHistory: this.localSettings.sync_full_history,
+        shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
+          return this.historySyncNotification(msg);
+        },
         userDevicesCache: this.userDevicesCache,
         transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 10 },
-        patchMessageBeforeSending: (message) => {
-          const requiresPatch = !!(message.buttonsMessage || message.listMessage || message.templateMessage);
-          if (requiresPatch) {
-            message = {
-              viewOnceMessageV2: {
-                message: {
-                  messageContextInfo: {
-                    deviceListMetadataVersion: 2,
-                    deviceListMetadata: {},
-                  },
-                  ...message,
-                },
-              },
-            };
+        patchMessageBeforeSending(message) {
+          if (
+            message.deviceSentMessage?.message?.listMessage?.listType ===
+            proto.Message.ListMessage.ListType.PRODUCT_LIST
+          ) {
+            message = JSON.parse(JSON.stringify(message));
+
+            message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+          }
+
+          if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
+            message = JSON.parse(JSON.stringify(message));
+
+            message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
           }
 
           return message;
@@ -1467,8 +1519,8 @@ export class WAStartupService {
       if (this.localProxy.enabled) {
         this.logger.verbose('Proxy enabled');
         options = {
-          agent: new ProxyAgent(this.localProxy.proxy as any),
-          fetchAgent: new ProxyAgent(this.localProxy.proxy as any),
+          agent: makeProxyAgent(this.localProxy.proxy),
+          fetchAgent: makeProxyAgent(this.localProxy.proxy),
         };
       }
 
@@ -1497,23 +1549,26 @@ export class WAStartupService {
         msgRetryCounterCache: this.msgRetryCounterCache,
         getMessage: async (key) => (await this.getMessage(key)) as Promise<proto.IMessage>,
         generateHighQualityLinkPreview: true,
-        syncFullHistory: false,
+        syncFullHistory: this.localSettings.sync_full_history,
+        shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
+          return this.historySyncNotification(msg);
+        },
         userDevicesCache: this.userDevicesCache,
         transactionOpts: { maxCommitRetries: 10, delayBetweenTriesMs: 10 },
-        patchMessageBeforeSending: (message) => {
-          const requiresPatch = !!(message.buttonsMessage || message.listMessage || message.templateMessage);
-          if (requiresPatch) {
-            message = {
-              viewOnceMessageV2: {
-                message: {
-                  messageContextInfo: {
-                    deviceListMetadataVersion: 2,
-                    deviceListMetadata: {},
-                  },
-                  ...message,
-                },
-              },
-            };
+        patchMessageBeforeSending(message) {
+          if (
+            message.deviceSentMessage?.message?.listMessage?.listType ===
+            proto.Message.ListMessage.ListType.PRODUCT_LIST
+          ) {
+            message = JSON.parse(JSON.stringify(message));
+
+            message.deviceSentMessage.message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
+          }
+
+          if (message.listMessage?.listType == proto.Message.ListMessage.ListType.PRODUCT_LIST) {
+            message = JSON.parse(JSON.stringify(message));
+
+            message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
           }
 
           return message;
@@ -1591,33 +1646,65 @@ export class WAStartupService {
 
   private readonly contactHandle = {
     'contacts.upsert': async (contacts: Contact[], database: Database) => {
-      this.logger.verbose('Event received: contacts.upsert');
+      try {
+        this.logger.verbose('Event received: contacts.upsert');
 
-      this.logger.verbose('Finding contacts in database');
-      const contactsRepository = await this.repository.contact.find({
-        where: { owner: this.instance.name },
-      });
+        this.logger.verbose('Finding contacts in database');
+        const contactsRepository = new Set(
+          (
+            await this.repository.contact.find({
+              select: { id: 1, _id: 0 },
+              where: { owner: this.instance.name },
+            })
+          ).map((contact) => contact.id),
+        );
 
-      this.logger.verbose('Verifying if contacts exists in database to insert');
-      const contactsRaw: ContactRaw[] = [];
-      for await (const contact of contacts) {
-        if (contactsRepository.find((cr) => cr.id === contact.id)) {
-          continue;
+        this.logger.verbose('Verifying if contacts exists in database to insert');
+        let contactsRaw: ContactRaw[] = [];
+
+        for (const contact of contacts) {
+          if (contactsRepository.has(contact.id)) {
+            continue;
+          }
+
+          contactsRaw.push({
+            id: contact.id,
+            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+            profilePictureUrl: null,
+            owner: this.instance.name,
+          });
         }
 
-        contactsRaw.push({
-          id: contact.id,
-          pushName: contact?.name || contact?.verifiedName,
-          profilePictureUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-          owner: this.instance.name,
-        });
+        this.logger.verbose('Sending data to webhook in event CONTACTS_UPSERT');
+        this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+
+        this.logger.verbose('Inserting contacts in database');
+        this.repository.contact.insert(contactsRaw, this.instance.name, database.SAVE_DATA.CONTACTS);
+
+        if (this.localChatwoot.enabled && this.localChatwoot.import_contacts && contactsRaw.length) {
+          this.chatwootService.addHistoryContacts({ instanceName: this.instance.name }, contactsRaw);
+          chatwootImport.importHistoryContacts({ instanceName: this.instance.name }, this.localChatwoot);
+        }
+
+        // Update profile pictures
+        contactsRaw = [];
+        for await (const contact of contacts) {
+          contactsRaw.push({
+            id: contact.id,
+            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+            profilePictureUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+            owner: this.instance.name,
+          });
+        }
+
+        this.logger.verbose('Sending data to webhook in event CONTACTS_UPDATE');
+        this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+
+        this.logger.verbose('Updating contacts in database');
+        this.repository.contact.update(contactsRaw, this.instance.name, database.SAVE_DATA.CONTACTS);
+      } catch (error) {
+        this.logger.error(error);
       }
-
-      this.logger.verbose('Sending data to webhook in event CONTACTS_UPSERT');
-      this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
-
-      this.logger.verbose('Inserting contacts in database');
-      this.repository.contact.insert(contactsRaw, this.instance.name, database.SAVE_DATA.CONTACTS);
     },
 
     'contacts.update': async (contacts: Partial<Contact>[], database: Database) => {
@@ -1647,7 +1734,7 @@ export class WAStartupService {
       {
         messages,
         chats,
-        isLatest,
+        contacts,
       }: {
         chats: Chat[];
         contacts: Contact[];
@@ -1656,55 +1743,126 @@ export class WAStartupService {
       },
       database: Database,
     ) => {
-      this.logger.verbose('Event received: messaging-history.set');
-      if (isLatest) {
-        this.logger.verbose('isLatest defined as true');
-        const chatsRaw: ChatRaw[] = chats.map((chat) => {
-          return {
+      try {
+        this.logger.verbose('Event received: messaging-history.set');
+
+        const instance: InstanceDto = { instanceName: this.instance.name };
+
+        const daysLimitToImport = this.localChatwoot.enabled ? this.localChatwoot.days_limit_import_messages : 1000;
+        this.logger.verbose(`Param days limit import messages is: ${daysLimitToImport}`);
+
+        const date = new Date();
+        const timestampLimitToImport = new Date(date.setDate(date.getDate() - daysLimitToImport)).getTime() / 1000;
+
+        const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
+
+        const processBatch = maxBatchTimestamp >= timestampLimitToImport;
+
+        if (!processBatch) {
+          this.logger.verbose('Batch ignored by maxTimestamp in this batch');
+          return;
+        }
+
+        const chatsRaw: ChatRaw[] = [];
+        const chatsRepository = new Set(
+          (
+            await this.repository.chat.find({
+              select: { id: 1, _id: 0 },
+              where: { owner: this.instance.name },
+            })
+          ).map((chat) => chat.id),
+        );
+
+        for (const chat of chats) {
+          if (chatsRepository.has(chat.id)) {
+            continue;
+          }
+
+          chatsRaw.push({
             id: chat.id,
             owner: this.instance.name,
             lastMsgTimestamp: chat.lastMessageRecvTimestamp,
-          };
-        });
+          });
+        }
 
         this.logger.verbose('Sending data to webhook in event CHATS_SET');
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
 
         this.logger.verbose('Inserting chats in database');
         this.repository.chat.insert(chatsRaw, this.instance.name, database.SAVE_DATA.CHATS);
+
+        const messagesRaw: MessageRaw[] = [];
+        const messagesRepository = new Set(
+          chatwootImport.getRepositoryMessagesCache(instance) ??
+            (
+              await this.repository.message.find({
+                select: { key: { id: 1 }, _id: 0 },
+                where: { owner: this.instance.name },
+              })
+            ).map((message) => message.key.id),
+        );
+
+        if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
+          chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
+        }
+
+        for (const m of messages) {
+          if (!m.message || !m.key || !m.messageTimestamp) {
+            continue;
+          }
+
+          if (Long.isLong(m?.messageTimestamp)) {
+            m.messageTimestamp = m.messageTimestamp?.toNumber();
+          }
+
+          if (m.messageTimestamp <= timestampLimitToImport) {
+            continue;
+          }
+
+          if (messagesRepository.has(m.key.id)) {
+            continue;
+          }
+
+          messagesRaw.push({
+            key: m.key,
+            pushName: m.pushName || m.key.remoteJid.split('@')[0],
+            participant: m.participant,
+            message: { ...m.message },
+            messageType: getContentType(m.message),
+            messageTimestamp: m.messageTimestamp as number,
+            owner: this.instance.name,
+          });
+        }
+
+        this.logger.verbose('Sending data to webhook in event MESSAGES_SET');
+        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
+
+        this.logger.verbose('Inserting messages in database');
+        await this.repository.message.insert(messagesRaw, this.instance.name, database.SAVE_DATA.NEW_MESSAGE);
+
+        if (this.localChatwoot.enabled && this.localChatwoot.import_messages && messagesRaw.length > 0) {
+          this.chatwootService.addHistoryMessages(
+            instance,
+            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+          );
+        }
+
+        await this.contactHandle['contacts.upsert'](
+          contacts
+            .filter((c) => !!c.notify ?? !!c.name)
+            .map((c) => ({
+              id: c.id,
+              name: c.name ?? c.notify,
+            })),
+          database,
+        );
+
+        contacts = undefined;
+        messages = undefined;
+        chats = undefined;
+      } catch (error) {
+        this.logger.error(error);
       }
-
-      const messagesRaw: MessageRaw[] = [];
-      const messagesRepository = await this.repository.message.find({
-        where: { owner: this.instance.name },
-      });
-      for await (const [, m] of Object.entries(messages)) {
-        if (!m.message) {
-          continue;
-        }
-        if (messagesRepository.find((mr) => mr.owner === this.instance.name && mr.key.id === m.key.id)) {
-          continue;
-        }
-
-        if (Long.isLong(m?.messageTimestamp)) {
-          m.messageTimestamp = m.messageTimestamp?.toNumber();
-        }
-
-        messagesRaw.push({
-          key: m.key,
-          pushName: m.pushName,
-          participant: m.participant,
-          message: { ...m.message },
-          messageType: getContentType(m.message),
-          messageTimestamp: m.messageTimestamp as number,
-          owner: this.instance.name,
-        });
-      }
-
-      this.logger.verbose('Sending data to webhook in event MESSAGES_SET');
-      this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw]);
-
-      messages = undefined;
     },
 
     'messages.upsert': async (
@@ -1741,10 +1899,16 @@ export class WAStartupService {
 
           let messageRaw: MessageRaw;
 
-          if (
-            (this.localWebhook.webhook_base64 === true && received?.message.documentMessage) ||
-            received?.message?.imageMessage
-          ) {
+          const isMedia =
+            received?.message?.imageMessage ||
+            received?.message?.videoMessage ||
+            received?.message?.stickerMessage ||
+            received?.message?.documentMessage ||
+            received?.message?.audioMessage;
+
+          const contentMsg = received.message[getContentType(received.message)] as any;
+
+          if (this.localWebhook.webhook_base64 === true && isMedia) {
             const buffer = await downloadMediaMessage(
               { key: received.key, message: received?.message },
               'buffer',
@@ -1761,6 +1925,7 @@ export class WAStartupService {
                 ...received.message,
                 base64: buffer ? buffer.toString('base64') : undefined,
               },
+              contextInfo: contentMsg?.contextInfo,
               messageType: getContentType(received.message),
               messageTimestamp: received.messageTimestamp as number,
               owner: this.instance.name,
@@ -1771,6 +1936,7 @@ export class WAStartupService {
               key: received.key,
               pushName: received.pushName,
               message: { ...received.message },
+              contextInfo: contentMsg?.contextInfo,
               messageType: getContentType(received.message),
               messageTimestamp: received.messageTimestamp as number,
               owner: this.instance.name,
@@ -1903,7 +2069,15 @@ export class WAStartupService {
           this.logger.verbose('group ignored');
           return;
         }
-        if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
+
+        if (status[update.status] === 'READ' && key.fromMe) {
+          if (this.localChatwoot.enabled) {
+            this.chatwootService.eventWhatsapp('messages.read', { instanceName: this.instance.name }, { key: key });
+          }
+        }
+
+        // if (key.remoteJid !== 'status@broadcast' && !key?.remoteJid?.match(/(:\d+)/)) {
+        if (key.remoteJid !== 'status@broadcast') {
           this.logger.verbose('Message update is valid');
 
           let pollUpdates: any;
@@ -2005,10 +2179,86 @@ export class WAStartupService {
     },
   };
 
+  private readonly labelHandle = {
+    [Events.LABELS_EDIT]: async (label: Label, database: Database) => {
+      this.logger.verbose('Event received: labels.edit');
+      this.logger.verbose('Finding labels in database');
+      const labelsRepository = await this.repository.labels.find({
+        where: { owner: this.instance.name },
+      });
+
+      const savedLabel = labelsRepository.find((l) => l.id === label.id);
+      if (label.deleted && savedLabel) {
+        this.logger.verbose('Sending data to webhook in event LABELS_EDIT');
+        await this.repository.labels.delete({
+          where: { owner: this.instance.name, id: label.id },
+        });
+        this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
+        return;
+      }
+
+      const labelName = label.name.replace(/[^\x20-\x7E]/g, '');
+      if (!savedLabel || savedLabel.color !== label.color || savedLabel.name !== labelName) {
+        this.logger.verbose('Sending data to webhook in event LABELS_EDIT');
+        await this.repository.labels.insert(
+          {
+            color: label.color,
+            name: labelName,
+            owner: this.instance.name,
+            id: label.id,
+            predefinedId: label.predefinedId,
+          },
+          this.instance.name,
+          database.SAVE_DATA.LABELS,
+        );
+        this.sendDataWebhook(Events.LABELS_EDIT, { ...label, instance: this.instance.name });
+      }
+    },
+
+    [Events.LABELS_ASSOCIATION]: async (
+      data: { association: LabelAssociation; type: 'remove' | 'add' },
+      database: Database,
+    ) => {
+      this.logger.verbose('Sending data to webhook in event LABELS_ASSOCIATION');
+
+      // Atualiza labels nos chats
+      if (database.SAVE_DATA.CHATS) {
+        const chats = await this.repository.chat.find({
+          where: {
+            owner: this.instance.name,
+          },
+        });
+        const chat = chats.find((c) => c.id === data.association.chatId);
+        if (chat) {
+          let labels = [...chat.labels];
+          if (data.type === 'remove') {
+            labels = labels.filter((label) => label !== data.association.labelId);
+          } else if (data.type === 'add') {
+            labels = [...labels, data.association.labelId];
+          }
+          await this.repository.chat.update(
+            [{ id: chat.id, owner: this.instance.name, labels }],
+            this.instance.name,
+            database.SAVE_DATA.CHATS,
+          );
+        }
+      }
+
+      // Envia dados para o webhook
+      this.sendDataWebhook(Events.LABELS_ASSOCIATION, {
+        instance: this.instance.name,
+        type: data.type,
+        chatId: data.association.chatId,
+        labelId: data.association.labelId,
+      });
+    },
+  };
+
   private eventHandler() {
     this.logger.verbose('Initializing event handler');
     this.client.ev.process(async (events) => {
       if (!this.endSession) {
+        this.logger.verbose(`Event received: ${Object.keys(events).join(', ')}`);
         const database = this.configService.get<Database>('DATABASE');
         const settings = await this.findSettings();
 
@@ -2141,6 +2391,20 @@ export class WAStartupService {
           const payload = events['contacts.update'];
           this.contactHandle['contacts.update'](payload, database);
         }
+
+        if (events[Events.LABELS_ASSOCIATION]) {
+          this.logger.verbose('Listening event: labels.association');
+          const payload = events[Events.LABELS_ASSOCIATION];
+          this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
+          return;
+        }
+
+        if (events[Events.LABELS_EDIT]) {
+          this.logger.verbose('Listening event: labels.edit');
+          const payload = events[Events.LABELS_EDIT];
+          this.labelHandle[Events.LABELS_EDIT](payload, database);
+          return;
+        }
       }
     });
   }
@@ -2177,6 +2441,35 @@ export class WAStartupService {
     } else {
       return jid;
     }
+  }
+
+  private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
+    const instance: InstanceDto = { instanceName: this.instance.name };
+
+    if (
+      this.localChatwoot.enabled &&
+      this.localChatwoot.import_messages &&
+      this.isSyncNotificationFromUsedSyncType(msg)
+    ) {
+      if (msg.chunkOrder === 1) {
+        this.chatwootService.startImportHistoryMessages(instance);
+      }
+
+      if (msg.progress === 100) {
+        setTimeout(() => {
+          this.chatwootService.importHistoryMessages(instance);
+        }, 10000);
+      }
+    }
+
+    return true;
+  }
+
+  private isSyncNotificationFromUsedSyncType(msg: proto.Message.IHistorySyncNotification) {
+    return (
+      (this.localSettings.sync_full_history && msg?.syncType === 2) ||
+      (!this.localSettings.sync_full_history && msg?.syncType === 3)
+    );
   }
 
   private createJid(number: string): string {
@@ -2321,7 +2614,15 @@ export class WAStartupService {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
     this.logger.verbose(`Exists: "${isWA.exists}" | jid: ${isWA.jid}`);
+
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
+      if (this.localChatwoot.enabled) {
+        const body = {
+          key: { remoteJid: isWA.jid },
+        };
+
+        this.chatwootService.eventWhatsapp('contact.is_not_in_wpp', { instanceName: this.instance.name }, body);
+      }
       throw new BadRequestException(isWA);
     }
 
@@ -2420,21 +2721,6 @@ export class WAStartupService {
               option as unknown as MiscMessageGenerationOptions,
             );
           }
-
-          if (!message['audio']) {
-            this.logger.verbose('Sending message');
-            return await this.client.sendMessage(
-              sender,
-              {
-                forward: {
-                  key: { remoteJid: this.instance.wuid, fromMe: true },
-                  message,
-                },
-                mentions,
-              },
-              option as unknown as MiscMessageGenerationOptions,
-            );
-          }
         }
         if (message['conversation']) {
           this.logger.verbose('Sending message');
@@ -2445,6 +2731,21 @@ export class WAStartupService {
               mentions,
               linkPreview: linkPreview,
             } as unknown as AnyMessageContent,
+            option as unknown as MiscMessageGenerationOptions,
+          );
+        }
+
+        if (!message['audio'] && !message['poll'] && sender != 'status@broadcast') {
+          this.logger.verbose('Sending message');
+          return await this.client.sendMessage(
+            sender,
+            {
+              forward: {
+                key: { remoteJid: this.instance.wuid, fromMe: true },
+                message,
+              },
+              mentions,
+            },
             option as unknown as MiscMessageGenerationOptions,
           );
         }
@@ -2470,10 +2771,13 @@ export class WAStartupService {
         );
       })();
 
+      const contentMsg = messageSent.message[getContentType(messageSent.message)] as any;
+
       const messageRaw: MessageRaw = {
         key: messageSent.key,
         pushName: messageSent.pushName,
         message: { ...messageSent.message },
+        contextInfo: contentMsg?.contextInfo,
         messageType: getContentType(messageSent.message),
         messageTimestamp: messageSent.messageTimestamp as number,
         owner: this.instance.name,
@@ -2845,6 +3149,7 @@ export class WAStartupService {
     let tempAudioPath: string;
     let outputAudio: string;
 
+    number = number.replace(/\D/g, '');
     const hash = `${number}-${new Date().getTime()}`;
     this.logger.verbose('Hash to audio name: ' + hash);
 
@@ -3012,7 +3317,7 @@ export class WAStartupService {
           buttonText: data.listMessage?.buttonText,
           footerText: data.listMessage?.footerText,
           sections: data.listMessage.sections,
-          listType: 1,
+          listType: 2,
         },
       },
       data?.options,
@@ -3087,29 +3392,76 @@ export class WAStartupService {
   public async whatsappNumber(data: WhatsAppNumberDto) {
     this.logger.verbose('Getting whatsapp number');
 
-    const onWhatsapp: OnWhatsAppDto[] = [];
-    for await (const number of data.numbers) {
-      let jid = this.createJid(number);
+    const jids: {
+      groups: { number: string; jid: string }[];
+      broadcast: { number: string; jid: string }[];
+      users: { number: string; jid: string; name?: string }[];
+    } = {
+      groups: [],
+      broadcast: [],
+      users: [],
+    };
+
+    data.numbers.forEach((number) => {
+      const jid = this.createJid(number);
 
       if (isJidGroup(jid)) {
+        jids.groups.push({ number, jid });
+      } else if (jid === 'status@broadcast') {
+        jids.broadcast.push({ number, jid });
+      } else {
+        jids.users.push({ number, jid });
+      }
+    });
+
+    const onWhatsapp: OnWhatsAppDto[] = [];
+
+    // BROADCAST
+    onWhatsapp.push(...jids.broadcast.map(({ jid, number }) => new OnWhatsAppDto(jid, false, number)));
+
+    // GROUPS
+    const groups = await Promise.all(
+      jids.groups.map(async ({ jid, number }) => {
         const group = await this.findGroup({ groupJid: jid }, 'inner');
 
-        if (!group) throw new BadRequestException('Group not found');
-
-        onWhatsapp.push(new OnWhatsAppDto(group.id, !!group?.id, group?.subject));
-      } else {
-        jid = !jid.startsWith('+') ? `+${jid}` : jid;
-        const verify = await this.client.onWhatsApp(jid);
-
-        const result = verify[0];
-
-        if (!result) {
-          onWhatsapp.push(new OnWhatsAppDto(jid, false));
-        } else {
-          onWhatsapp.push(new OnWhatsAppDto(result.jid, result.exists));
+        if (!group) {
+          new OnWhatsAppDto(jid, false, number);
         }
-      }
-    }
+
+        return new OnWhatsAppDto(group.id, !!group?.id, number, group?.subject);
+      }),
+    );
+    onWhatsapp.push(...groups);
+
+    // USERS
+    const contacts: ContactRaw[] = await this.repository.contact.findManyById({
+      owner: this.instance.name,
+      ids: jids.users.map(({ jid }) => (jid.startsWith('+') ? jid.substring(1) : jid)),
+    });
+    const verify = await this.client.onWhatsApp(
+      ...jids.users.map(({ jid }) => (!jid.startsWith('+') ? `+${jid}` : jid)),
+    );
+    const users: OnWhatsAppDto[] = await Promise.all(
+      jids.users.map(async (user) => {
+        const MAX_SIMILARITY_THRESHOLD = 0.01;
+        const isBrWithDigit = user.jid.startsWith('55') && user.jid.slice(4, 5) === '9' && user.jid.length === 28;
+        const jid = isBrWithDigit ? user.jid.slice(0, 4) + user.jid.slice(5) : user.jid;
+
+        const numberVerified = verify.find((v) => {
+          const mainJidSimilarity = levenshtein.get(user.jid, v.jid) / Math.max(user.jid.length, v.jid.length);
+          const jidSimilarity = levenshtein.get(jid, v.jid) / Math.max(jid.length, v.jid.length);
+          return mainJidSimilarity <= MAX_SIMILARITY_THRESHOLD || jidSimilarity <= MAX_SIMILARITY_THRESHOLD;
+        });
+        return {
+          exists: !!numberVerified?.exists,
+          jid: numberVerified?.jid || user.jid,
+          name: contacts.find((c) => c.id === jid)?.pushName,
+          number: user.number,
+        };
+      }),
+    );
+
+    onWhatsapp.push(...users);
 
     return onWhatsapp;
   }
@@ -3507,6 +3859,21 @@ export class WAStartupService {
     }
   }
 
+  public async updateMessage(data: UpdateMessageDto) {
+    try {
+      const jid = this.createJid(data.number);
+
+      this.logger.verbose('Updating message');
+      return await this.client.sendMessage(jid, {
+        text: data.text,
+        edit: data.key,
+      });
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException(error.toString());
+    }
+  }
+
   // Group
   public async createGroup(create: CreateGroupDto) {
     this.logger.verbose('Creating group: ' + create.subject);
@@ -3686,6 +4053,16 @@ export class WAStartupService {
     }
   }
 
+  public async acceptInviteCode(id: AcceptGroupInvite) {
+    this.logger.verbose('Joining the group by invitation code: ' + id.inviteCode);
+    try {
+      const groupJid = await this.client.groupAcceptInvite(id.inviteCode);
+      return { accepted: true, groupJid: groupJid };
+    } catch (error) {
+      throw new NotFoundException('Accept invite error', error.toString());
+    }
+  }
+
   public async revokeInviteCode(id: GroupJid) {
     this.logger.verbose('Revoking invite code for group: ' + id.groupJid);
     try {
@@ -3748,6 +4125,49 @@ export class WAStartupService {
       return { groupJid: id.groupJid, leave: true };
     } catch (error) {
       throw new BadRequestException('Unable to leave the group', error.toString());
+    }
+  }
+
+  public async fetchLabels(): Promise<LabelDto[]> {
+    this.logger.verbose('Fetching labels');
+    const labels = await this.repository.labels.find({
+      where: {
+        owner: this.instance.name,
+      },
+    });
+
+    return labels.map((label) => ({
+      color: label.color,
+      name: label.name,
+      id: label.id,
+      predefinedId: label.predefinedId,
+    }));
+  }
+
+  public async handleLabel(data: HandleLabelDto) {
+    this.logger.verbose('Adding label');
+    const whatsappContact = await this.whatsappNumber({ numbers: [data.number] });
+    if (whatsappContact.length === 0) {
+      throw new NotFoundException('Number not found');
+    }
+    const contact = whatsappContact[0];
+    if (!contact.exists) {
+      throw new NotFoundException('Number is not on WhatsApp');
+    }
+
+    try {
+      if (data.action === 'add') {
+        await this.client.addChatLabel(contact.jid, data.labelId);
+
+        return { numberJid: contact.jid, labelId: data.labelId, add: true };
+      }
+      if (data.action === 'remove') {
+        await this.client.removeChatLabel(contact.jid, data.labelId);
+
+        return { numberJid: contact.jid, labelId: data.labelId, remove: true };
+      }
+    } catch (error) {
+      throw new BadRequestException(`Unable to ${data.action} label to chat`, error.toString());
     }
   }
 }

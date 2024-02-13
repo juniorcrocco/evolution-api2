@@ -10,9 +10,9 @@ import { RedisCache } from '../../libs/redis.client';
 import { InstanceDto } from '../dto/instance.dto';
 import { RepositoryBroker } from '../repository/repository.manager';
 import { AuthService, OldToken } from '../services/auth.service';
+import { CacheService } from '../services/cache.service';
 import { ChatwootService } from '../services/chatwoot.service';
 import { WAMonitoringService } from '../services/monitor.service';
-import { ProxyService } from '../services/proxy.service';
 import { RabbitmqService } from '../services/rabbitmq.service';
 import { SettingsService } from '../services/settings.service';
 import { SqsService } from '../services/sqs.service';
@@ -34,10 +34,10 @@ export class InstanceController {
     private readonly settingsService: SettingsService,
     private readonly websocketService: WebsocketService,
     private readonly rabbitmqService: RabbitmqService,
-    private readonly proxyService: ProxyService,
     private readonly sqsService: SqsService,
     private readonly typebotService: TypebotService,
     private readonly cache: RedisCache,
+    private readonly chatwootCache: CacheService,
   ) {}
 
   private readonly logger = new Logger(InstanceController.name);
@@ -57,12 +57,16 @@ export class InstanceController {
     chatwoot_sign_msg,
     chatwoot_reopen_conversation,
     chatwoot_conversation_pending,
+    chatwoot_import_contacts,
+    chatwoot_import_messages,
+    chatwoot_days_limit_import_messages,
     reject_call,
     msg_call,
     groups_ignore,
     always_online,
     read_messages,
     read_status,
+    sync_full_history,
     websocket_enabled,
     websocket_events,
     rabbitmq_enabled,
@@ -76,7 +80,6 @@ export class InstanceController {
     typebot_delay_message,
     typebot_unknown_message,
     typebot_listening_from_me,
-    proxy,
   }: InstanceDto) {
     try {
       this.logger.verbose('requested createInstance from ' + instanceName + ' instance');
@@ -85,7 +88,13 @@ export class InstanceController {
       await this.authService.checkDuplicateToken(token);
 
       this.logger.verbose('creating instance');
-      const instance = new WAStartupService(this.configService, this.eventEmitter, this.repository, this.cache);
+      const instance = new WAStartupService(
+        this.configService,
+        this.eventEmitter,
+        this.repository,
+        this.cache,
+        this.chatwootCache,
+      );
       instance.instanceName = instanceName;
 
       const instanceId = v4();
@@ -142,6 +151,8 @@ export class InstanceController {
               'GROUP_UPDATE',
               'GROUP_PARTICIPANTS_UPDATE',
               'CONNECTION_UPDATE',
+              'LABELS_EDIT',
+              'LABELS_ASSOCIATION',
               'CALL',
               'NEW_JWT_TOKEN',
               'TYPEBOT_START',
@@ -192,6 +203,8 @@ export class InstanceController {
               'GROUP_UPDATE',
               'GROUP_PARTICIPANTS_UPDATE',
               'CONNECTION_UPDATE',
+              'LABELS_EDIT',
+              'LABELS_ASSOCIATION',
               'CALL',
               'NEW_JWT_TOKEN',
               'TYPEBOT_START',
@@ -239,6 +252,8 @@ export class InstanceController {
               'GROUP_UPDATE',
               'GROUP_PARTICIPANTS_UPDATE',
               'CONNECTION_UPDATE',
+              'LABELS_EDIT',
+              'LABELS_ASSOCIATION',
               'CALL',
               'NEW_JWT_TOKEN',
               'TYPEBOT_START',
@@ -254,22 +269,6 @@ export class InstanceController {
           });
 
           rabbitmqEvents = (await this.rabbitmqService.find(instance)).events;
-        } catch (error) {
-          this.logger.log(error);
-        }
-      }
-
-      if (proxy) {
-        this.logger.verbose('creating proxy');
-        try {
-          this.proxyService.create(
-            instance,
-            {
-              enabled: true,
-              proxy,
-            },
-            false,
-          );
         } catch (error) {
           this.logger.log(error);
         }
@@ -302,6 +301,8 @@ export class InstanceController {
               'GROUP_UPDATE',
               'GROUP_PARTICIPANTS_UPDATE',
               'CONNECTION_UPDATE',
+              'LABELS_EDIT',
+              'LABELS_ASSOCIATION',
               'CALL',
               'NEW_JWT_TOKEN',
               'TYPEBOT_START',
@@ -353,6 +354,7 @@ export class InstanceController {
         always_online: always_online || false,
         read_messages: read_messages || false,
         read_status: read_status || false,
+        sync_full_history: sync_full_history ?? false,
       };
 
       this.logger.verbose('settings: ' + JSON.stringify(settings));
@@ -406,7 +408,6 @@ export class InstanceController {
           },
           settings,
           qrcode: getQrcode,
-          proxy,
         };
 
         this.logger.verbose('instance created');
@@ -456,6 +457,9 @@ export class InstanceController {
           number,
           reopen_conversation: chatwoot_reopen_conversation || false,
           conversation_pending: chatwoot_conversation_pending || false,
+          import_contacts: chatwoot_import_contacts ?? true,
+          import_messages: chatwoot_import_messages ?? true,
+          days_limit_import_messages: chatwoot_days_limit_import_messages ?? 60,
           auto_create: true,
         });
       } catch (error) {
@@ -506,11 +510,13 @@ export class InstanceController {
           sign_msg: chatwoot_sign_msg || false,
           reopen_conversation: chatwoot_reopen_conversation || false,
           conversation_pending: chatwoot_conversation_pending || false,
+          import_contacts: chatwoot_import_contacts ?? true,
+          import_messages: chatwoot_import_messages ?? true,
+          days_limit_import_messages: chatwoot_days_limit_import_messages || 60,
           number,
           name_inbox: instance.instanceName,
           webhook_url: `${urlServer}/chatwoot/webhook/${encodeURIComponent(instance.instanceName)}`,
         },
-        proxy,
       };
     } catch (error) {
       this.logger.error(error.message[0]);
@@ -569,6 +575,7 @@ export class InstanceController {
       switch (state) {
         case 'open':
           this.logger.verbose('logging out instance: ' + instanceName);
+          instance.clearCacheChatwoot();
           await instance.reloadConnection();
           await delay(2000);
 
@@ -634,6 +641,7 @@ export class InstanceController {
     }
     try {
       this.waMonitor.waInstances[instanceName]?.removeRabbitmqQueues();
+      this.waMonitor.waInstances[instanceName]?.clearCacheChatwoot();
 
       if (instance.state === 'connecting') {
         this.logger.verbose('logging out instance: ' + instanceName);
@@ -643,10 +651,15 @@ export class InstanceController {
 
       this.logger.verbose('deleting instance: ' + instanceName);
 
-      this.waMonitor.waInstances[instanceName].sendDataWebhook(Events.INSTANCE_DELETE, {
-        instanceName,
-        instanceId: (await this.repository.auth.find(instanceName))?.instanceId,
-      });
+      try {
+        this.waMonitor.waInstances[instanceName].sendDataWebhook(Events.INSTANCE_DELETE, {
+          instanceName,
+          instanceId: (await this.repository.auth.find(instanceName))?.instanceId,
+        });
+      } catch (error) {
+        this.logger.error(error);
+      }
+
       delete this.waMonitor.waInstances[instanceName];
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
